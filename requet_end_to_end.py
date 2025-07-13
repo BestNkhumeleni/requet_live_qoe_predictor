@@ -14,8 +14,9 @@ Combined script to train and evaluate Requet QoE prediction models:
 
 import os
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
-
+import pickle
 import numpy as np
 import pandas as pd
 
@@ -26,6 +27,12 @@ from scapy.all import rdpcap, IP, TCP, UDP
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import KFold
+
+import joblib
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from collections import Counter
 
 # =============================================================================
 # 1. CONFIGURATION AND REQUET DATASET CLONING
@@ -414,7 +421,83 @@ def get_txt_files(directory_path):
         # No permission to list this directory
         return []
 
+
+
+def train_resolution_model(
+    all_chunks,
+    test_size=0.2,
+    random_state=42,
+    model_path='rf_model.pkl',
+    encoder_path='label_encoder.pkl'
+):
+    """
+    Train a Random Forest to predict video resolution per chunk and aggregate predictions per stream.
     
+    Parameters:
+    - all_chunks: list of streams; each stream is a list of chunks;
+                  each chunk is [time_stamp, chunk_duration, ttfb, slacktime,
+                                 download_time, chunk_size, audio_video, resolution]
+    - test_size: fraction of streams to reserve for testing (default 0.2)
+    - random_state: seed for reproducibility (default 42)
+    - model_path: filepath to save the trained Random Forest (default 'rf_model.pkl')
+    - encoder_path: filepath to save the LabelEncoder (default 'label_encoder.pkl')
+    
+    Returns:
+    - clf: trained RandomForestClassifier
+    - le: fitted LabelEncoder for resolution labels
+    - stream_acc: accuracy of stream-level resolution prediction
+    """
+    # Flatten chunk-level data and track stream IDs
+    X, y, stream_ids = [], [], []
+    for sid, chunks in enumerate(all_chunks):
+        for chunk in chunks:
+            features = chunk[:7]             # use first 7 entries as features
+            label = chunk[7]                 # resolution label
+            X.append(features)
+            y.append(label)
+            stream_ids.append(sid)
+    X = np.array(X, dtype=float)
+    y = np.array(y)
+
+    # Encode resolution labels
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+
+    # Split streams for train/test at the chunk level, preserving stream grouping
+    X_train, X_test, y_train, y_test, train_ids, test_ids = train_test_split(
+        X, y_enc, stream_ids, test_size=test_size, random_state=random_state, stratify=y_enc
+    )
+
+    # Train the Random Forest
+    clf = RandomForestClassifier(n_estimators=100, random_state=random_state)
+    clf.fit(X_train, y_train)
+
+    # Save the model and encoder
+    joblib.dump(clf, model_path)
+    joblib.dump(le, encoder_path)
+
+    # Evaluate stream-level accuracy by majority vote
+    true_by_stream, pred_by_stream = {}, {}
+    for xi, yi_true, sid in zip(X_test, y_test, test_ids):
+        yi_pred = clf.predict([xi])[0]
+        true_by_stream.setdefault(sid, []).append(yi_true)
+        pred_by_stream.setdefault(sid, []).append(yi_pred)
+
+    stream_true_labels = {}
+    stream_pred_labels = {}
+    for sid in true_by_stream:
+        stream_true_labels[sid] = Counter(true_by_stream[sid]).most_common(1)[0][0]
+        stream_pred_labels[sid] = Counter(pred_by_stream[sid]).most_common(1)[0][0]
+
+    stream_acc = sum(
+        1 for sid in stream_true_labels
+        if stream_true_labels[sid] == stream_pred_labels[sid]
+    ) / len(stream_true_labels)
+
+    print(f"Stream-level resolution prediction accuracy: {stream_acc:.2%}")
+    return clf, le, stream_acc
+
+
 
 def get_PCAP_files(directory_path):
     """
@@ -598,83 +681,125 @@ def getChunks(pkt_list, client_ip,uplink,downlink, resolution):
 
 
 
-def process_group(group_name):
+def process_experiment(txt_path, pcap_path):
     """
-    Process one Requet group (e.g., "groupA") and return:
-      - X_chunks: concatenated features for all chunks in that group
-      - Y_bw_all, Y_vs_all, Y_res_all: corresponding label arrays
-      - clip_ids: list of clip identifiers aligned with chunk indices
+    Process one txt/pcap pair and return its chunks list and the resolution.
+    """
+    clip_id = os.path.splitext(os.path.basename(txt_path))[0]
+
+    # 1. parse merge
+    merged_df = parse_merged_txt(txt_path)
+    first_rel_ms = float(merged_df.iloc[0, 0])
+    global start_time_epoch
+    start_time_epoch = first_rel_ms
+
+    # 2. pcap
+    pkt_list = load_pcap_packets(pcap_path)
+    ips = [
+        merged_df["Network Info 1"][0][0],
+        merged_df["Network Info 2"][0][0],
+        merged_df["Network Info 3"][0][0],
+    ]
+    # majority vote for client IP
+    client_ip = max(set(ips), key=ips.count)
+    if ips.count(client_ip) == 1:
+        raise ValueError(f"Ambiguous client IPs {ips} for {pcap_path}")
+
+    uplink, downlink = group_packets_by_flow(pkt_list, client_ip)
+
+    # 3. get “predicted” (i.e. playback‐info) resolution
+    resolution = get_resolution_from_playback_info(txt_path)
+
+    # 4. chunk detection
+    chunks = getChunks(pkt_list, client_ip, uplink, downlink, resolution)
+    return chunks, resolution
+
+
+def process_group(group_name, max_workers=None):
+    """
+    Process all txt/pcap pairs under DATASET_DIR/group_name in parallel.
+    Prints per‐job status, remaining count, and resolution.
+    Returns a flat list of all chunks.
     """
     group_dir = os.path.join(DATASET_DIR, group_name)
-    
-    group_dir_txt = group_dir + "/MERGED_FILES"
-    group_dir_pcap = group_dir + "/PCAP_FILES"
-    # print(group_dir_txt)
-    txt_files = sorted(get_txt_files(group_dir_txt))
-    pcap_files = sorted(get_PCAP_files(group_dir_pcap))
-    print(f"[INFO] Processing {len(txt_files)} txt files and {len(pcap_files)} pcap files in {group_name}...")
-    # print(f"  txt files: {txt_files[:5]} ...")
-    # print(f"  pcap files: {pcap_files[:5]} ...")
-    # print()
-    X_list, bw_list, vs_list, res_list, clip_list = [], [], [], [], []
-    # Global start_time for alignment (set per experiment)
-    global start_time_epoch
+    txt_dir   = os.path.join(group_dir, "MERGED_FILES")
+    pcap_dir  = os.path.join(group_dir, "PCAP_FILES")
 
+    txt_files  = sorted(get_txt_files(txt_dir))
+    pcap_files = sorted(get_PCAP_files(pcap_dir))
+    pairs1      = list(zip(txt_files, pcap_files))
     i = 0
-    all_chunks = []
-    for txt_path, pcap_path in zip(txt_files, pcap_files):
-        # print("preparing for ", txt_path, pcap_path)
-        #print how many files are yet to be processed
-        print(f"[INFO] Processing {txt_path} and {pcap_path} ...")
-        print("[INFO] Remaining files: ", len(txt_files) - i)
-        i += 1
-        clip_id = os.path.splitext(os.path.basename(txt_path))[0]
-        # 1. Parse merged.txt
-        merged_df = parse_merged_txt(txt_path)
-        # Assume column 0 = Relative Time (ms), so start_time_epoch = first timestamp in seconds
-        
-        first_rel_ms = float(merged_df.iloc[0, 0])
-        start_time_epoch = first_rel_ms 
+    for txt,pcap in pairs1:
+        resolution = get_resolution_from_playback_info(txt)
+        if resolution == "1080p" or resolution == "1440p" or resolution == "2160p":
+            txt_files.remove(txt)
+            pcap_files.remove(pcap)
+            i+=1
+            print(f"removed file whos resolution was {resolution} file #{i}")
 
-        # 2. Parse PCAP
-        pkt_list = load_pcap_packets(pcap_path)
-        # Determine client IP: take the src from the first Network Info in merged_df
-        # We assume merged_df column 6 holds [IP_Src, IP_Dst, ...] for flow 1
-        # netinfo1 = merged_df.iloc[0, 6]
-        client_ip_1 = merged_df["Network Info 1"][0][0]
-        client_ip_2 = merged_df["Network Info 2"][0][0]
-        client_ip_3 = merged_df["Network Info 3"][0][0]
+    pairs = list(zip(txt_files, pcap_files))
+    print(f"[INFO] Submitting {len(pairs)} jobs for {group_name}…")
+    max_workers = max_workers or os.cpu_count()
 
-        if client_ip_1 == client_ip_2 and client_ip_1 == client_ip_3:
-            client_ip = client_ip_1
-        elif client_ip_1 == client_ip_2:
-            client_ip = client_ip_1
-        elif client_ip_1 == client_ip_3:
-            client_ip = client_ip_1
-        elif client_ip_2 == client_ip_3:
-            client_ip = client_ip_2
-        else:
-            # If all three are different, we cannot determine a single client IP
-            print(f"[WARN] Multiple client IPs detected for {pcap_path}: {client_ip_1}, {client_ip_2}, {client_ip_3}. Using first one.")
-            #end the program here
-            raise ValueError(f"Multiple client IPs detected for {pcap_path}: {client_ip_1}, {client_ip_2}, {client_ip_3}.")
-        
+    all_chunks  = []
+    total_jobs  = len(pairs)
+    done_count  = 0
 
-        if not client_ip:
-            print(f"[WARN] Could not infer client IP for {pcap_path}. Skipping.")
-            continue
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_experiment, txt, pcap): (txt, pcap)
+            for txt, pcap in pairs
+        }
 
-        uplink, downlink = group_packets_by_flow(pkt_list, client_ip)
+        for fut in as_completed(futures):
+            done_count += 1
+            remaining = total_jobs - done_count
+            txt_path, pcap_path = futures[fut]
 
-        resolution = get_resolution_from_playback_info(txt_path)
-        print(f"Resolution for {txt_path}: {resolution}")
+            try:
+                chunks, resolution = fut.result()
+                all_chunks.extend(chunks)
+                save_all_chunks(all_chunks)
+                print(f"[OK]    {os.path.basename(txt_path)} → {len(chunks)} chunks, Predicted resolution: {resolution}")
+            except Exception as e:
+                print(f"[ERROR] {os.path.basename(txt_path)} failed: {e}")
 
-        # 3. Chunk detection per flow
-        
-        all_chunks.append(getChunks(pkt_list, client_ip,uplink, downlink, resolution))
-
+            print(f"[INFO] Jobs remaining: {remaining}")
 
     return all_chunks
+
+
+def save_all_chunks(all_chunks, filepath='all_chunks.pkl'):
+    """
+    Saves the nested all_chunks list to disk without altering its structure.
+
+    Parameters:
+    - all_chunks: list of streams; each stream is a list of chunks (as defined)
+    - filepath: path to the output pickle file (default 'all_chunks.pkl')
+    """
+    with open(filepath, 'wb') as f:
+        pickle.dump(all_chunks, f)
+    print(f"Saved all_chunks structure to {filepath}")
+
+def load_all_chunks(filepath='all_chunks.pkl'):
+    """
+    Loads the nested all_chunks list from disk.
+
+    Parameters:
+    - filepath: path to the input pickle file
+
+    Returns:
+    - all_chunks: the nested list structure loaded from disk
+    """
+    with open(filepath, 'rb') as f:
+        all_chunks = pickle.load(f)
+    return all_chunks
+
+# Example usage:
+# save_all_chunks(all_chunks, 'my_chunks.pkl')
+# restored_chunks = load_all_chunks('my_chunks.pkl')
+
+
       
 
 def main():
@@ -683,8 +808,11 @@ def main():
 
     # 2. Process Group A
     print("[INFO] Processing groupA ...")
-    all_chunks = process_group("groupA")
+    all_chunks = process_group("A")
+    save_all_chunks(all_chunks)
 
+
+    # clf, le, stream_acc = train_resolution_model(all_chunks) 
     # print("Total number of streams in groupA:", len(all_chunks))
 
     # 2.5. Extract features and labels from chunks
