@@ -590,7 +590,7 @@ def get_resolution_from_playback_info(stream_name):
 
  
 
-def getChunks(pkt_list, client_ip,uplink,downlink, resolution):
+# def getChunks(pkt_list, client_ip,uplink,downlink, resolution):
     #a chunk can be defined as you meet you first uplink, wait until a downlink happends
 
     # uplink, downlink = group_packets_by_flow(pkt_list, client_ip)
@@ -605,12 +605,22 @@ def getChunks(pkt_list, client_ip,uplink,downlink, resolution):
     request_size = 0
     downlink_pkts = None
     size = []
+    i = 0
     
     for pkt in pkt_list:
         chunky = [0,0,0,0,0,0,0,0] # time_stamp,Chunk Duration,ttfb,slacktime,Download time,chunk_size,Audio(0) or vidoe(1)
         ts, plen, src, dst, sport, dport, proto = pkt
         # 6=TCP, 17=UDP
-        chunky[0] = start_time_epoch
+        if i == 0:
+            normal_time = ts
+            start_time_epoch = ts
+        i +=1
+
+#6=TCP, 17=UDP
+
+        chunky [0] = start_time_epoch- normal_time
+
+        # chunky[0] = start_time_epoch
         flow_key = (src, dst, sport, dport, proto)
 
         if src == client_ip and dport == 443: #this is an uplink packet, likely a GET request
@@ -681,6 +691,124 @@ def getChunks(pkt_list, client_ip,uplink,downlink, resolution):
 
 
 
+# from scapy.all import rdpcap, IP, TCP
+# from collections import defaultdict
+
+def getChunks(pcap_path, client_ip, resolution,
+                     get_thresh=300, down_thresh=300, min_chunk_size=600):
+    """
+    Parses a pcap file, groups packets into HTTP(S) GET-response "chunks"
+    using the same thresholds and feature computations as the live version.
+
+    Returns a list of:
+      [ start_ts,
+        chunk_duration,
+        ttfb,
+        slack_time,
+        download_time,
+        chunk_size,
+        audio(0)/video(1),
+        resolution ]
+    """
+    # load all packets
+    pkts = rdpcap(pcap_path)
+
+    # state variables
+    stream_start_ts     = None
+    start_time_epoch    = None
+    slacktime           = 0
+    chunk_size          = 0
+    ttfb                = 0.0
+    we_got_first_uplink = False
+    first_downlink      = False
+
+    # per‐flow buffers of payload-lengths
+    uplink   = defaultdict(list)
+    downlink = defaultdict(list)
+
+    chunks = []
+
+    def sum_bytes(lst):
+        return sum(lst)
+
+    for pkt in pkts:
+        if not pkt.haslayer(IP) or not pkt.haslayer(TCP):
+            continue
+
+        ts    = pkt.time
+        ip    = pkt[IP]
+        sport = pkt[TCP].sport
+        dport = pkt[TCP].dport
+        plen  = len(pkt[TCP].payload)   # payload length only
+
+        # initialize on first packet
+        if stream_start_ts is None:
+            stream_start_ts  = ts
+            start_time_epoch = ts
+            slacktime        = ts
+
+        rel_ts = ts - stream_start_ts
+        flow_key = (ip.src, ip.dst, sport, dport)
+
+        # —— CLIENT → SERVER (uplink GET)
+        if ip.src == client_ip and dport == 443:
+            uplink[flow_key].append(plen)
+            upl_size = sum_bytes(uplink[flow_key])
+
+            # trigger chunk boundary only if we cross get_thresh
+            if not we_got_first_uplink and upl_size > get_thresh:
+                # compute features exactly as in live version
+                ts0           = start_time_epoch
+                duration      = ts - ts0
+                slack         = ts - slacktime
+                download_time = duration - slack - ttfb
+
+                raw = [
+                    ts0,                          # [0] chunk start
+                    duration,                     # [1] duration
+                    ttfb,                         # [2] TTFB
+                    slack,                        # [3] slack time
+                    download_time,                # [4] download time
+                    chunk_size,                   # [5] downlink bytes
+                    0 if upl_size < min_chunk_size else 1  # [6] audio/video
+                ]
+
+                # only keep if enough downlink data
+                if chunk_size >= min_chunk_size:
+                    chunks.append(raw + [resolution])
+
+                # ── reset for next chunk, just like live logic ──
+                chunk_size          = upl_size
+                start_time_epoch    = ts
+                slacktime           = ts
+                ttfb                = 0.0
+                we_got_first_uplink = True
+                first_downlink      = False
+
+                # clear buffers so next GET must re-accumulate
+                uplink[flow_key].clear()
+                downlink[flow_key].clear()
+
+        # —— SERVER → CLIENT (downlink response)
+        elif ip.dst == client_ip and sport == 443:
+            we_got_first_uplink = False
+
+            downlink[flow_key].append(plen)
+            down_size = sum_bytes(downlink[flow_key])
+
+            if not first_downlink and down_size > down_thresh:
+                chunk_size     += down_size
+                ttfb            = ts - start_time_epoch
+                first_downlink  = True
+
+            # update slack marker for next cycle
+            slacktime = ts
+
+    return chunks
+
+
+
+
 def process_experiment(txt_path, pcap_path):
     """
     Process one txt/pcap pair and return its chunks list and the resolution.
@@ -711,7 +839,7 @@ def process_experiment(txt_path, pcap_path):
     resolution = get_resolution_from_playback_info(txt_path)
 
     # 4. chunk detection
-    chunks = getChunks(pkt_list, client_ip, uplink, downlink, resolution)
+    chunks = getChunks(pcap_path, client_ip, uplink, downlink, resolution)
     return chunks, resolution
 
 
@@ -731,7 +859,7 @@ def process_group(group_name, max_workers=None):
     i = 0
     for txt,pcap in pairs1:
         resolution = get_resolution_from_playback_info(txt)
-        if resolution == "1080p" or resolution == "1440p" or resolution == "2160p":
+        if (resolution == "1080p" or resolution == "1440p" or resolution == "2160p"):
             txt_files.remove(txt)
             pcap_files.remove(pcap)
             i+=1
