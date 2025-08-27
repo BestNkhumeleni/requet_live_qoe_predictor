@@ -21,7 +21,7 @@ downlink_size = 0
 prev_packet = None
 fistpacket = None
 got_first_packet = False
-
+interpacket_spacing_intime = 0
 stop_sniffing = False
 
 def human_iface_or_default(iface_arg: str | None):
@@ -150,7 +150,7 @@ def main():
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
 
-    def print_chunk_summary(first_pkt, last_pkt):
+    def print_chunk_summary(first_pkt, last_pkt,jitter):
         #takes the first pkt (an uplink) and the last pkt also an uplink
         total_size = uplink_size + downlink_size
         if total_packets > 0:
@@ -158,10 +158,13 @@ def main():
             print("Total packets: ", total_packets)
             # print("Uplink packets: ", uplink_packets)
             # print("Uplink size: ", uplink_size)
-            print("Downlink packets: ", downlink_packets)
+            # print("Downlink packets: ", downlink_packets)
             print("Downlink size: ", downlink_size)
             print("Total size: ", total_size)
-            print("Chunk duration: ", last_pkt.time - first_pkt.time)
+            print("Chunk duration: ", (last_pkt.time - first_pkt.time)*1000, "ms")
+            print("average time between packets: ", ((last_pkt.time - first_pkt.time)/total_packets)*1000, "ms")
+            print("Inter-packet spacing (jitter) average: ", (jitter/total_packets)*1000, "ms/pkt")
+            print("bitrate: ", (downlink_size*8)/((last_pkt.time - first_pkt.time)+0.000001)/1000, "Kbps")
             #duration of chunk
 
             print("-" * 20)
@@ -176,12 +179,12 @@ def main():
         # Only consider IP packets on web ports
         if not is_web_port(pkt):
             return
-
+        
         length = pkt_len(pkt)
         if length <= 0:
             return
 
-        global total_packets, uplink_packets, downlink_packets, uplink_size, downlink_size, prev_packet, fistpacket, got_first_packet
+        global total_packets, uplink_packets, downlink_packets, uplink_size, downlink_size, prev_packet, fistpacket, got_first_packet, interpacket_spacing_intime
         total_packets += 1
 
         dirn = direction_of(pkt)
@@ -191,16 +194,19 @@ def main():
             got_first_packet = True
 
         if prev_packet and prev_dir == "downlink" and dirn == "uplink":
-            print_chunk_summary(fistpacket, pkt)
+            print_chunk_summary(fistpacket, pkt,interpacket_spacing_intime)
             total_packets = uplink_packets = downlink_packets = uplink_size = downlink_size = 0
             got_first_packet = False
 
-        if dirn == "uplink":
+        elif dirn == "uplink":
+            # pkt.time - prev_packet.time if prev_packet else 0
+            interpacket_spacing_intime += pkt.time - prev_packet.time if prev_packet else 0
             uplink_packets += 1
             uplink_size += length
             # if not args.quiet:
                 # print(f"↑ {length} bytes")
         elif dirn == "downlink":
+            interpacket_spacing_intime += pkt.time - prev_packet.time if prev_packet else 0
             downlink_packets += 1
             downlink_size += length
             # if not args.quiet:
