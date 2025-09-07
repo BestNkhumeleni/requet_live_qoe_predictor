@@ -11,6 +11,7 @@ import argparse
 import signal
 import sys
 from scapy.all import sniff, conf, get_if_addr, get_if_list, IP, IPv6, TCP, UDP
+from Visualiser import Visualiser
 
 # Global counters
 total_packets = 0
@@ -21,8 +22,10 @@ downlink_size = 0
 prev_packet = None
 fistpacket = None
 got_first_packet = False
+video_started = False
 interpacket_spacing_intime = 0
 stop_sniffing = False
+visualiser = None
 
 def human_iface_or_default(iface_arg: str | None):
     """Pick interface: use provided one or the default route's interface."""
@@ -35,6 +38,7 @@ def get_local_addrs(iface: str):
     """Return (ipv4, ipv6) string addresses for the interface if available."""
     ipv4 = None
     ipv6 = None
+    
     try:
         ipv4 = get_if_addr(iface)
     except Exception:
@@ -83,6 +87,7 @@ def build_direction_checker(local_ipv4: str | None):
     we fall back to comparing by route ownership when possible.
     """
     def direction(pkt):
+        CH_HTTPS = 443
         """
         Returns 'uplink' if packet is from us to the internet,
                 'downlink' if to us from the internet,
@@ -97,6 +102,15 @@ def build_direction_checker(local_ipv4: str | None):
                     return "uplink"
                 if dst == local_ipv4:
                     return "downlink"
+            else:
+                tcp = pkt[TCP] if TCP in pkt else None
+                is_uplink = (tcp.dport == CH_HTTPS)
+                # is_downlink = (tcp.sport == )
+                if is_uplink:
+                    return "uplink"
+                else:
+                    return "downlink"
+            
             # As a fallback, if the default route interface matches, infer direction by routing
             # (this is a weak heuristic; most systems will have local_ipv4 above anyway)
             default_if = conf.route.route(dst)[0]
@@ -123,7 +137,7 @@ def build_direction_checker(local_ipv4: str | None):
 def main():
     parser = argparse.ArgumentParser(description="Capture web traffic to/from this machine and print a summary.")
     parser.add_argument("--iface", help="Network interface to listen on (e.g., wlp4s0, eth0). Defaults to system default.")
-    parser.add_argument("--duration", type=int, default=30, help="Capture duration in seconds (0 = until Ctrl+C).")
+    parser.add_argument("--duration", type=int, default=600, help="Capture duration in seconds (0 = until Ctrl+C).")
     parser.add_argument("--quiet", action="store_true", help="Don’t print per-packet logs.")
     args = parser.parse_args()
 
@@ -162,7 +176,7 @@ def main():
             print("Downlink size: ", downlink_size)
             print("Total size: ", total_size)
             print("Chunk duration: ", (last_pkt.time - first_pkt.time)*1000, "ms")
-            print("average time between packets: ", ((last_pkt.time - first_pkt.time)/total_packets)*1000, "ms")
+            # print("average time between packets: ", ((last_pkt.time - first_pkt.time)/total_packets)*1000, "ms")
             print("Inter-packet spacing (jitter) average: ", (jitter/total_packets)*1000, "ms/pkt")
             print("bitrate: ", (downlink_size*8)/((last_pkt.time - first_pkt.time)+0.000001)/1000, "Kbps")
             #duration of chunk
@@ -184,19 +198,25 @@ def main():
         if length <= 0:
             return
 
-        global total_packets, uplink_packets, downlink_packets, uplink_size, downlink_size, prev_packet, fistpacket, got_first_packet, interpacket_spacing_intime
+        global total_packets, uplink_packets, downlink_packets, uplink_size, downlink_size, prev_packet, fistpacket, got_first_packet, interpacket_spacing_intime, video_started, visualiser
         total_packets += 1
 
         dirn = direction_of(pkt)
         prev_dir = direction_of(prev_packet) if prev_packet else None
         if not got_first_packet:
+            #instatiate the visualiser if video_started is false
+            if not video_started:
+                video_started = True
+                visualiser = Visualiser(pkt.time)
             fistpacket = pkt
             got_first_packet = True
+        visualiser.add_packet(pkt)
 
         if prev_packet and prev_dir == "downlink" and dirn == "uplink":
             print_chunk_summary(fistpacket, pkt,interpacket_spacing_intime)
             total_packets = uplink_packets = downlink_packets = uplink_size = downlink_size = 0
             got_first_packet = False
+
 
         elif dirn == "uplink":
             # pkt.time - prev_packet.time if prev_packet else 0
@@ -217,6 +237,7 @@ def main():
                 print(f"• {length} bytes (unknown direction)")
         
         prev_packet = pkt
+
 
     try:
         sniff(

@@ -114,9 +114,11 @@ def process_pcap_file(pcap_path: str, resolution: str):
     first_time = None
     prev_time = None
     prev_was_downlink = False  # used to detect boundary with current uplink
+    first_down = False
+    first_down_time = None
 
     def finalize_chunk():
-        nonlocal p_count, upl_count, down_count, upl_bytes, down_bytes, jitter_sum, first_time, prev_time, prev_was_downlink
+        nonlocal p_count, upl_count, down_count, upl_bytes, down_bytes, jitter_sum, first_time, prev_time, prev_was_downlink, first_down, first_down_time
         if down_bytes > 0 and down_count > 1 and p_count > 0 and first_time is not None and prev_time is not None:
             duration = (prev_time - first_time)
             # Avoid div by zero; keep same units as your code
@@ -134,6 +136,7 @@ def process_pcap_file(pcap_path: str, resolution: str):
             row[5] = jitter_ms
             row[6] = bitrate_kbps
             row[7] = resolution
+            print(f"[DEBUG] Chunk finalized: {row}")
             chunks.append(row)
 
         # reset accumulators for the NEXT chunk
@@ -146,6 +149,7 @@ def process_pcap_file(pcap_path: str, resolution: str):
         first_time = None
         prev_time = None
         prev_was_downlink = False
+        first_down = False
 
     try:
         with PcapReader(pcap_path) as pr:
@@ -169,6 +173,10 @@ def process_pcap_file(pcap_path: str, resolution: str):
 
                     is_uplink = (tcp.dport == CH_HTTPS)
                     is_downlink = (tcp.sport == CH_HTTPS)
+
+                    if is_downlink and first_down is False:
+                        first_down = True
+
 
                     # sizes: use TCP payload length to match your original logic
                     pay_len = len(tcp.payload) if tcp.payload else 0
